@@ -180,6 +180,64 @@ app.post("/setup/bootstrap", async (req, res) => {
   }
 });
 
+/**
+ * POST /auth/register
+ * Crea un nuevo tenant + usuario (admin o agent)
+ */
+app.post("/auth/register", async (req, res) => {
+  const { tenant_name, admin_email, admin_name, admin_password, role } = req.body || {};
+
+  if (!tenant_name || !admin_email || !admin_name || !admin_password) {
+    return res.status(400).json({
+      ok: false,
+      error: "missing_fields",
+      required: ["tenant_name", "admin_email", "admin_name", "admin_password"],
+    });
+  }
+
+  // Validar rol
+  const userRole = role && (role === 'admin' || role === 'agent') ? role : 'admin';
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const tenantIns = await client.query(
+      `INSERT INTO public.tenants (name) VALUES ($1)
+       RETURNING id, name, status, created_at`,
+      [tenant_name]
+    );
+    const tenant = tenantIns.rows[0];
+
+    const rounds = parseInt(process.env.BCRYPT_ROUNDS || "10", 10);
+    const password_hash = await bcrypt.hash(admin_password, rounds);
+
+    const userIns = await client.query(
+      `INSERT INTO public.users (tenant_id, email, name, password_hash, role)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, tenant_id, email, name, role, created_at`,
+      [tenant.id, admin_email, admin_name, password_hash, userRole]
+    );
+    const user = userIns.rows[0];
+
+    await client.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'user_registered', $3::jsonb)`,
+      [tenant.id, user.id, JSON.stringify({ tenant_name, admin_email, role: userRole })]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ ok: true, tenant, user });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {

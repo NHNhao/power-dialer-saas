@@ -141,6 +141,15 @@ export default function Agent() {
               </span>
             </div>
 
+            {/* Campaign Manager Link */}
+            <button 
+              className="btn ghost"
+              onClick={() => router.push('/campaigns')}
+              style={{ fontSize: '13px' }}
+            >
+              Campañas
+            </button>
+
             {/* Language Selector */}
             <select 
               value={lang} 
@@ -350,15 +359,20 @@ export default function Agent() {
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   {muted ? (
-                    <path d="M1 1l22 22M9 9v6a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                    <>
+                      <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+                      <line x1="23" y1="9" x2="17" y2="15"/>
+                      <line x1="17" y1="9" x2="23" y2="15"/>
+                    </>
                   ) : (
                     <>
-                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2m14 0a9 9 0 0 1-18 0v-2h18v2z" />
+                      <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+                      <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                      <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
                     </>
                   )}
                 </svg>
-                {muted ? '🔇 Unmute' : '🎤 Mute'}
+                {muted ? 'Activar' : 'Silenciar'}
               </button>
             </div>
 
