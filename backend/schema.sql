@@ -13,14 +13,15 @@ CREATE TABLE IF NOT EXISTS public.tenants (
 CREATE TABLE IF NOT EXISTS public.users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
-  email VARCHAR(255) NOT NULL,
+  username VARCHAR(255) NOT NULL,
+  email VARCHAR(255),
   name VARCHAR(255),
   password_hash TEXT NOT NULL,
   role VARCHAR(50) DEFAULT 'agent', -- admin, manager, agent
   status VARCHAR(50) DEFAULT 'active',
   created_at TIMESTAMP DEFAULT now(),
   updated_at TIMESTAMP DEFAULT now(),
-  UNIQUE(tenant_id, email)
+  UNIQUE(tenant_id, username)
 );
 
 -- Campaigns
@@ -97,6 +98,17 @@ CREATE TABLE IF NOT EXISTS public.call_log (
   created_at TIMESTAMP DEFAULT now()
 );
 
+-- Email Verifications (temporal para cambios de email)
+CREATE TABLE IF NOT EXISTS public.email_verifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  new_email VARCHAR(255) NOT NULL,
+  verification_code VARCHAR(10) NOT NULL,
+  expires_at TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT now(),
+  UNIQUE(user_id)
+);
+
 -- Audit Log
 CREATE TABLE IF NOT EXISTS public.audit_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -112,7 +124,7 @@ CREATE TABLE IF NOT EXISTS public.audit_log (
 
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_users_tenant ON public.users(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_users_email ON public.users(email);
+CREATE INDEX IF NOT EXISTS idx_users_username ON public.users(username);
 CREATE INDEX IF NOT EXISTS idx_campaigns_tenant ON public.campaigns(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_campaigns_status ON public.campaigns(status);
 CREATE INDEX IF NOT EXISTS idx_leads_tenant ON public.leads(tenant_id);

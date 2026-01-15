@@ -32,16 +32,16 @@ const mock = {
   }
 };
 
-export async function login(email, password) {
+export async function login(username, password) {
   if (USE_MOCK) {
-    if (email === 'admin@example.com' && password === 'secret') {
+    if (username === 'admin' && password === 'secret') {
       return { ok: true, token: mock.token, user: mock.user };
     }
     return { ok: false, error: 'invalid_credentials' };
   }
 
   const res = await fetch('http://localhost:3001/auth/login', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password })
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password })
   });
   return res.json();
 }

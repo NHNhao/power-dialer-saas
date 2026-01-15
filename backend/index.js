@@ -182,10 +182,11 @@ app.post("/setup/bootstrap", async (req, res) => {
 
 /**
  * POST /auth/register
- * Crea un nuevo tenant + usuario (admin o agent)
+ * Crea un nuevo tenant + usuario ADMIN
+ * Solo administradores pueden crear cuentas
  */
 app.post("/auth/register", async (req, res) => {
-  const { tenant_name, admin_email, admin_name, admin_password, role } = req.body || {};
+  const { tenant_name, admin_email, admin_name, admin_password } = req.body || {};
 
   if (!tenant_name || !admin_email || !admin_name || !admin_password) {
     return res.status(400).json({
@@ -195,8 +196,8 @@ app.post("/auth/register", async (req, res) => {
     });
   }
 
-  // Validar rol
-  const userRole = role && (role === 'admin' || role === 'agent') ? role : 'admin';
+  // Generar username automáticamente: nombre + ".admin"
+  const admin_username = admin_name.toLowerCase().trim().replace(/\s+/g, '.') + '.admin';
 
   const client = await pool.connect();
   try {
@@ -213,58 +214,90 @@ app.post("/auth/register", async (req, res) => {
     const password_hash = await bcrypt.hash(admin_password, rounds);
 
     const userIns = await client.query(
-      `INSERT INTO public.users (tenant_id, email, name, password_hash, role)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, tenant_id, email, name, role, created_at`,
-      [tenant.id, admin_email, admin_name, password_hash, userRole]
+      `INSERT INTO public.users (tenant_id, username, name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, tenant_id, username, name, email, role, created_at`,
+      [tenant.id, admin_username, admin_name, admin_email, password_hash, 'admin']
     );
     const user = userIns.rows[0];
+
+    // Crear JWT token
+    const payload = {
+      user_id: user.id,
+      tenant_id: user.tenant_id,
+      role: user.role,
+      username: user.username,
+      name: user.name,
+      email: user.email
+    };
+    
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    });
 
     await client.query(
       `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
        VALUES ($1, $2, 'user_registered', $3::jsonb)`,
-      [tenant.id, user.id, JSON.stringify({ tenant_name, admin_email, role: userRole })]
+      [tenant.id, user.id, JSON.stringify({ tenant_name, admin_username, admin_email, role: 'admin' })]
     );
 
     await client.query("COMMIT");
-    return res.json({ ok: true, tenant, user });
+    return res.json({ 
+      ok: true, 
+      token, 
+      user: payload,
+      tenant 
+    });
   } catch (e) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    return res.status(500).json({ ok: false, error: e.message });
+    
+    // Manejar errores específicos
+    if (e.code === '23505') {
+      // Duplicate key - el email ya existe
+      return res.status(400).json({ ok: false, error: 'duplicate_key' });
+    }
+    
+    console.error('Error en registro:', e);
+    return res.status(500).json({ ok: false, error: 'register_failed' });
   } finally {
     client.release();
   }
 });
 
 app.post("/auth/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ ok: false, error: "missing_email_or_password" });
+  const { username, password } = req.body || {};
+  console.log('Login attempt - username:', username, 'password length:', password?.length);
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: "missing_username_or_password" });
   }
 
   try {
+    // Buscar por email O username (el parámetro se llama username por compatibilidad)
     const r = await pool.query(
-      `SELECT id, tenant_id, email, name, role, password_hash
+      `SELECT id, tenant_id, username, name, email, role, password_hash
        FROM public.users
-       WHERE email = $1
+       WHERE username = $1 OR email = $1
        LIMIT 1`,
-      [email]
+      [username]
     );
 
+    console.log('User found:', r.rowCount > 0 ? r.rows[0].username : 'none');
     if (r.rowCount === 0) return res.status(401).json({ ok: false, error: "invalid_credentials" });
 
     const u = r.rows[0];
     const ok = await bcrypt.compare(password, u.password_hash);
+    console.log('Password match:', ok);
     if (!ok) return res.status(401).json({ ok: false, error: "invalid_credentials" });
 
     const payload = {
       user_id: u.id,
       tenant_id: u.tenant_id,
       role: u.role,
-      email: u.email,
+      username: u.username,
       name: u.name,
+      email: u.email,
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, {
@@ -1194,6 +1227,581 @@ app.post("/dialer/parallel/start", requireAuth, requireAdmin, async (req, res) =
     launched,
     errors,
   });
+});
+
+// ---------------------
+// ADMIN ENDPOINTS
+// ---------------------
+
+/**
+ * GET /admin/agents
+ * Lista todos los agentes de un tenant
+ */
+app.get("/admin/agents", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, tenant_id, username, name, role, status, created_at
+       FROM public.users
+       WHERE tenant_id = $1 AND role = 'agent'
+       ORDER BY created_at DESC`,
+      [req.user.tenant_id]
+    );
+
+    return res.json({ ok: true, agents: r.rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// ---------------------
+// Helper functions for auto-generation
+// ---------------------
+function generateUsername(name) {
+  // Crear username a partir del nombre: "Juan Perez" -> "juan.perez" o si existe agregar números
+  const base = name
+    .toLowerCase()
+    .trim()
+    .split(/\s+/)
+    .join('.');
+  return base;
+}
+
+function generatePassword(length = 12) {
+  // Generar contraseña segura: letras mayúsculas, minúsculas, números y símbolos
+  const uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const lowercase = 'abcdefghijklmnopqrstuvwxyz';
+  const numbers = '0123456789';
+  const symbols = '!@#$%^&*';
+  const all = uppercase + lowercase + numbers + symbols;
+
+  let password = '';
+  password += uppercase.charAt(Math.floor(Math.random() * uppercase.length));
+  password += lowercase.charAt(Math.floor(Math.random() * lowercase.length));
+  password += numbers.charAt(Math.floor(Math.random() * numbers.length));
+  password += symbols.charAt(Math.floor(Math.random() * symbols.length));
+
+  for (let i = password.length; i < length; i++) {
+    password += all.charAt(Math.floor(Math.random() * all.length));
+  }
+
+  // Shuffle la contraseña
+  return password.split('').sort(() => 0.5 - Math.random()).join('');
+}
+
+// ---------------------
+// Admin Agents Endpoints
+// ---------------------
+/**
+ * POST /admin/agents
+ * Crea un nuevo agente para el tenant del admin
+ * Genera username y contraseña automáticamente basado en el nombre
+ */
+app.post("/admin/agents", requireAuth, requireAdmin, async (req, res) => {
+  const { name } = req.body || {};
+
+  if (!name || !name.trim()) {
+    return res.status(400).json({
+      ok: false,
+      error: "missing_name",
+      message: "El nombre del agente es requerido"
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Generar username a partir del nombre
+    let username = generateUsername(name);
+    let counter = 1;
+
+    // Si el username ya existe, agregar números hasta encontrar uno único
+    let checkUsername = await client.query(
+      `SELECT id FROM public.users WHERE tenant_id = $1 AND username = $2`,
+      [req.user.tenant_id, username]
+    );
+
+    while (checkUsername.rowCount > 0) {
+      username = generateUsername(name) + counter;
+      checkUsername = await client.query(
+        `SELECT id FROM public.users WHERE tenant_id = $1 AND username = $2`,
+        [req.user.tenant_id, username]
+      );
+      counter++;
+    }
+
+    // Generar contraseña segura
+    const password = generatePassword(12);
+
+    const rounds = parseInt(process.env.BCRYPT_ROUNDS || "10", 10);
+    const password_hash = await bcrypt.hash(password, rounds);
+
+    const agentIns = await client.query(
+      `INSERT INTO public.users (tenant_id, username, name, password_hash, role, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, tenant_id, username, name, role, status, created_at`,
+      [req.user.tenant_id, username, name, password_hash, 'agent', 'active']
+    );
+
+    const agent = agentIns.rows[0];
+
+    await client.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'agent_created', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ agent_username: username, agent_name: name })]
+    );
+
+    await client.query("COMMIT");
+    
+    // Retornar el agente CON LA CONTRASEÑA (solo esta vez, para mostrar al admin)
+    return res.json({ 
+      ok: true, 
+      agent: {
+        ...agent,
+        generated_password: password  // Solo retornar esta vez
+      },
+      message: "Agente creado exitosamente. Comparte estas credenciales con el agente."
+    });
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {}
+    return res.status(500).json({ ok: false, error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * PATCH /admin/agents/:id
+ * Cambia el estado (active/inactive) de un agente
+ */
+app.patch("/admin/agents/:id", requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body || {};
+
+  if (!status || !['active', 'inactive'].includes(status)) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid_status",
+      valid: ["active", "inactive"]
+    });
+  }
+
+  try {
+    // Verificar que el agente pertenece al tenant del admin
+    const checkAgent = await pool.query(
+      `SELECT id FROM public.users WHERE id = $1 AND tenant_id = $2 AND role = 'agent'`,
+      [id, req.user.tenant_id]
+    );
+
+    if (checkAgent.rowCount === 0) {
+      return res.status(403).json({ ok: false, error: "agent_not_found" });
+    }
+
+    const r = await pool.query(
+      `UPDATE public.users SET status = $1, updated_at = now()
+       WHERE id = $2
+       RETURNING id, email, name, role, status, created_at`,
+      [status, id]
+    );
+
+    await pool.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'agent_status_changed', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ agent_id: id, new_status: status })]
+    );
+
+    return res.json({ ok: true, agent: r.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * DELETE /admin/agents/:id
+ * Elimina un agente (soft delete)
+ */
+app.delete("/admin/agents/:id", requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Verificar que el agente pertenece al tenant del admin
+    const checkAgent = await pool.query(
+      `SELECT id FROM public.users WHERE id = $1 AND tenant_id = $2 AND role = 'agent'`,
+      [id, req.user.tenant_id]
+    );
+
+    if (checkAgent.rowCount === 0) {
+      return res.status(403).json({ ok: false, error: "agent_not_found" });
+    }
+
+    await pool.query(
+      `UPDATE public.users SET status = 'deleted', updated_at = now()
+       WHERE id = $1`,
+      [id]
+    );
+
+    await pool.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'agent_deleted', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ agent_id: id })]
+    );
+
+    return res.json({ ok: true, message: "Agent deleted" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * GET /admin/campaigns
+ * Lista todas las campañas de un tenant
+ */
+app.get("/admin/campaigns", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, tenant_id, name, description, status, start_date, end_date, script, created_by, created_at
+       FROM public.campaigns
+       WHERE tenant_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.tenant_id]
+    );
+
+    return res.json({ ok: true, campaigns: r.rows });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /admin/campaigns
+ * Crea una nueva campaña para el tenant del admin
+ */
+app.post("/admin/campaigns", requireAuth, requireAdmin, async (req, res) => {
+  const { name, description, script, status, start_date, end_date } = req.body || {};
+
+  if (!name) {
+    return res.status(400).json({
+      ok: false,
+      error: "missing_fields",
+      required: ["name"]
+    });
+  }
+
+  // Validar status si se proporciona
+  const validStatuses = ['draft', 'active', 'paused', 'completed'];
+  const campaignStatus = status && validStatuses.includes(status) ? status : 'draft';
+
+  try {
+    const r = await pool.query(
+      `INSERT INTO public.campaigns (tenant_id, name, description, script, status, start_date, end_date, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, tenant_id, name, description, status, start_date, end_date, script, created_by, created_at`,
+      [req.user.tenant_id, name, description || null, script || null, campaignStatus, start_date || null, end_date || null, req.user.user_id]
+    );
+
+    const campaign = r.rows[0];
+
+    await pool.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'campaign_created', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ campaign_name: name, campaign_id: campaign.id, status: campaignStatus })]
+    );
+
+    return res.json({ ok: true, campaign });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * PATCH /admin/campaigns/:id
+ * Actualiza una campaña
+ */
+app.patch("/admin/campaigns/:id", requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, description, status, script, start_date, end_date } = req.body || {};
+
+  try {
+    // Verificar que la campaña pertenece al tenant del admin
+    const checkCampaign = await pool.query(
+      `SELECT id FROM public.campaigns WHERE id = $1 AND tenant_id = $2`,
+      [id, req.user.tenant_id]
+    );
+
+    if (checkCampaign.rowCount === 0) {
+      return res.status(403).json({ ok: false, error: "campaign_not_found" });
+    }
+
+    const updates = [];
+    const params = [];
+    let paramCount = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramCount}`);
+      params.push(name);
+      paramCount++;
+    }
+    if (description !== undefined) {
+      updates.push(`description = $${paramCount}`);
+      params.push(description);
+      paramCount++;
+    }
+    if (status !== undefined) {
+      updates.push(`status = $${paramCount}`);
+      params.push(status);
+      paramCount++;
+    }
+    if (script !== undefined) {
+      updates.push(`script = $${paramCount}`);
+      params.push(script);
+      paramCount++;
+    }
+    if (start_date !== undefined) {
+      updates.push(`start_date = $${paramCount}`);
+      params.push(start_date);
+      paramCount++;
+    }
+    if (end_date !== undefined) {
+      updates.push(`end_date = $${paramCount}`);
+      params.push(end_date);
+      paramCount++;
+    }
+
+    updates.push(`updated_at = now()`);
+    params.push(id);
+
+    const query = `UPDATE public.campaigns SET ${updates.join(', ')} WHERE id = $${paramCount} RETURNING *`;
+    const r = await pool.query(query, params);
+
+    await pool.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'campaign_updated', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ campaign_id: id })]
+    );
+
+    return res.json({ ok: true, campaign: r.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------------------
+// Admin Settings Endpoints
+// ---------------------
+
+/**
+ * GET /admin/profile
+ * Obtener perfil del usuario administrador actual
+ */
+app.get("/admin/profile", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, username, name, email, role, status, created_at
+       FROM public.users
+       WHERE id = $1 AND tenant_id = $2`,
+      [req.user.user_id, req.user.tenant_id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+
+    return res.json({ ok: true, user: r.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * PUT /admin/profile
+ * Actualizar nombre y email del usuario
+ * Si el email es diferente, genera un código de verificación y lo envía
+ */
+app.put("/admin/profile", requireAuth, requireAdmin, async (req, res) => {
+  const { name, email } = req.body || {};
+
+  if (!name || !email) {
+    return res.status(400).json({ ok: false, error: "missing_name_or_email" });
+  }
+
+  try {
+    const user = await pool.query(
+      `SELECT id, email FROM public.users WHERE id = $1 AND tenant_id = $2`,
+      [req.user.user_id, req.user.tenant_id]
+    );
+
+    if (user.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+
+    const currentEmail = user.rows[0].email;
+    const emailChanged = email !== currentEmail;
+
+    // Actualizar nombre (siempre)
+    await pool.query(
+      `UPDATE public.users SET name = $1 WHERE id = $2`,
+      [name, req.user.user_id]
+    );
+
+    // Si el email cambió, generar código de verificación
+    if (emailChanged) {
+      const verificationCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutos
+
+      // Guardar código de verificación en una tabla temporal
+      await pool.query(
+        `INSERT INTO public.email_verifications (user_id, new_email, verification_code, expires_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id)
+         DO UPDATE SET
+           new_email = EXCLUDED.new_email,
+           verification_code = EXCLUDED.verification_code,
+           expires_at = EXCLUDED.expires_at`,
+        [req.user.user_id, email, verificationCode, expiresAt]
+      );
+
+      // TODO: Aquí iría la lógica para enviar el email con el código
+      // Por ahora lo retornamos en la respuesta para testing
+      console.log(`[EMAIL] Verification code for ${email}: ${verificationCode}`);
+
+      return res.json({
+        ok: true,
+        message: "name_updated_email_verification_sent",
+        verification_code: verificationCode // Solo para desarrollo, remover en producción
+      });
+    }
+
+    return res.json({ ok: true, message: "profile_updated" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /admin/verify-email
+ * Verificar código y actualizar email
+ */
+app.post("/admin/verify-email", requireAuth, requireAdmin, async (req, res) => {
+  const { code, new_email } = req.body || {};
+
+  if (!code || !new_email) {
+    return res.status(400).json({ ok: false, error: "missing_code_or_email" });
+  }
+
+  try {
+    // Buscar y validar el código
+    const r = await pool.query(
+      `SELECT id, new_email, verification_code, expires_at
+       FROM public.email_verifications
+       WHERE user_id = $1 AND expires_at > now()`,
+      [req.user.user_id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(400).json({ ok: false, error: "verification_code_expired" });
+    }
+
+    const verification = r.rows[0];
+
+    if (verification.verification_code !== code.toUpperCase()) {
+      return res.status(400).json({ ok: false, error: "invalid_verification_code" });
+    }
+
+    if (verification.new_email !== new_email) {
+      return res.status(400).json({ ok: false, error: "email_mismatch" });
+    }
+
+    // Actualizar email en users
+    await pool.query(
+      `UPDATE public.users SET email = $1 WHERE id = $2`,
+      [new_email, req.user.user_id]
+    );
+
+    // Eliminar registro de verificación
+    await pool.query(
+      `DELETE FROM public.email_verifications WHERE user_id = $1`,
+      [req.user.user_id]
+    );
+
+    // Actualizar token JWT con nuevo email
+    const payload = {
+      user_id: req.user.user_id,
+      tenant_id: req.user.tenant_id,
+      role: req.user.role,
+      username: req.user.username,
+      name: req.user.name,
+      email: new_email
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    });
+
+    return res.json({
+      ok: true,
+      message: "email_verified_and_updated",
+      token,
+      user: payload
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /admin/change-password
+ * Cambiar contraseña del usuario
+ */
+app.post("/admin/change-password", requireAuth, requireAdmin, async (req, res) => {
+  const { current_password, new_password } = req.body || {};
+
+  if (!current_password || !new_password) {
+    return res.status(400).json({ ok: false, error: "missing_passwords" });
+  }
+
+  if (new_password.length < 6) {
+    return res.status(400).json({ ok: false, error: "password_too_short" });
+  }
+
+  try {
+    // Obtener contraseña actual
+    const r = await pool.query(
+      `SELECT id, password_hash FROM public.users WHERE id = $1 AND tenant_id = $2`,
+      [req.user.user_id, req.user.tenant_id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "user_not_found" });
+    }
+
+    const user = r.rows[0];
+    const passwordMatches = await bcrypt.compare(current_password, user.password_hash);
+
+    if (!passwordMatches) {
+      return res.status(401).json({ ok: false, error: "invalid_current_password" });
+    }
+
+    // Hash de la nueva contraseña
+    const newPasswordHash = await bcrypt.hash(new_password, parseInt(process.env.BCRYPT_ROUNDS || 10));
+
+    // Actualizar contraseña
+    await pool.query(
+      `UPDATE public.users SET password_hash = $1 WHERE id = $2`,
+      [newPasswordHash, req.user.user_id]
+    );
+
+    // Registrar en audit log
+    await pool.query(
+      `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
+       VALUES ($1, $2, 'password_changed', $3::jsonb)`,
+      [req.user.tenant_id, req.user.user_id, JSON.stringify({ changed_at: new Date().toISOString() })]
+    );
+
+    return res.json({ ok: true, message: "password_changed" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ---------------------

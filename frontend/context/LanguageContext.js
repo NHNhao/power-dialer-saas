@@ -4,7 +4,7 @@ const LanguageContext = createContext(null)
 
 const translations = {
   en: {
-    loginTitle: 'Agent Console — Login',
+    loginTitle: 'Console - Login',
     email: 'Email',
     password: 'Password',
     login: 'Login',
@@ -22,7 +22,7 @@ const translations = {
     selectCampaign: 'Select campaign'
   },
   es: {
-    loginTitle: 'Consola de Agente — Login',
+    loginTitle: 'Consola - Login',
     email: 'Correo',
     password: 'Contraseña',
     login: 'Entrar',

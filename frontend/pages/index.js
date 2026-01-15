@@ -5,11 +5,11 @@ import { useLanguage } from '../context/LanguageContext'
 
 export default function LoginPage() {
   const [mode, setMode] = useState('login'); // 'login' o 'register'
-  const [email, setEmail] = useState('admin@example.com');
-  const [password, setPassword] = useState('secret');
-  const [name, setName] = useState('');
-  const [tenantName, setTenantName] = useState('');
-  const [role, setRole] = useState('admin'); // 'admin' o 'agent'
+  const [username, setUsername] = useState(''); // Solo para login
+  const [email, setEmail] = useState(''); // Solo para registro
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState(''); // Solo para registro
+  const [tenantName, setTenantName] = useState(''); // Solo para registro
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(false);
   const router = useRouter();
@@ -22,38 +22,50 @@ export default function LoginPage() {
     setLoading(true);
     try {
       if (mode === 'register') {
-        // Registro
+        // Registro - enviar nombre de empresa, nombre, email y contraseña
         const res = await fetch('http://localhost:3001/auth/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             tenant_name: tenantName,
-            admin_email: email,
             admin_name: name,
-            admin_password: password,
-            role: role
+            admin_email: email,
+            admin_password: password
           })
         });
         const j = await res.json();
+        console.log('Respuesta de registro:', j);
         if (!j.ok) {
-          const errorMsg = getErrorMessage(j.error);
+          console.log('Error en registro:', j.error);
+          const errorMsg = getErrorMessage(j.error, false); // false = registro
           return setErr(errorMsg);
         }
-        // Auto-login después de registro
-        const loginRes = await auth.login(email, password);
+        // Auto-login después de registro usando el username generado
+        const generatedUsername = j.user?.username;
+        console.log('Username generado para auto-login:', generatedUsername);
+        const loginRes = await auth.login(generatedUsername, password);
+        console.log('Resultado de auto-login:', loginRes);
         if (!loginRes.ok) {
-          const errorMsg = getErrorMessage(loginRes.error);
+          console.log('Error en auto-login:', loginRes.error);
+          const errorMsg = getErrorMessage(loginRes.error, true); // true = login
           return setErr(errorMsg);
         }
-        router.push('/agent');
+        // Redirigir al dashboard de administrador
+        router.push('/admin-dashboard');
       } else {
-        // Login
-        const j = await auth.login(email, password);
+        // Login - usar username
+        const j = await auth.login(username, password);
         if (!j.ok) {
-          const errorMsg = getErrorMessage(j.error);
+          const errorMsg = getErrorMessage(j.error, true); // true = login
           return setErr(errorMsg);
         }
-        router.push('/agent');
+        // Redirigir según rol
+        const userRole = j.user?.role;
+        if (userRole === 'admin') {
+          router.push('/admin-dashboard');
+        } else {
+          router.push('/agent');
+        }
       }
     } catch (e) {
       setErr('Error de conexión. Verifica que el servidor esté funcionando.');
@@ -62,21 +74,42 @@ export default function LoginPage() {
     }
   }
 
-  function getErrorMessage(error) {
-    const errorMessages = {
-      'invalid_credentials': 'Email o contraseña incorrectos',
-      'missing_email_or_password': 'Por favor ingresa email y contraseña',
-      'missing_fields': 'Por favor completa todos los campos',
-      'register_failed': 'Error al crear la cuenta',
-      'login_failed': 'Error al iniciar sesión'
+  function getErrorMessage(error, isLogin = true) {
+    // Mensajes específicos para login
+    const loginMessages = {
+      'invalid_credentials': 'Usuario o contraseña incorrectos',
+      'missing_username_or_password': 'Por favor ingresa usuario y contraseña',
     };
     
-    // Si el error contiene información de base de datos, mostrar mensaje genérico
+    // Mensajes específicos para registro
+    const registerMessages = {
+      'missing_fields': 'Por favor completa todos los campos requeridos',
+      'register_failed': 'Error al crear la cuenta. Intenta nuevamente.',
+      'duplicate_key': 'Ya existe una cuenta con ese email',
+    };
+    
+    // Mensajes comunes
+    const commonMessages = {
+      'login_failed': 'Error al iniciar sesión',
+      'connection_error': 'Error de conexión. Verifica que el servidor esté funcionando.',
+    };
+    
+    // Si el error contiene información de base de datos
     if (error && (error.includes('autentificación') || error.includes('password') || error.includes('dialer_owner'))) {
       return 'Error de conexión con la base de datos. Por favor contacta al administrador.';
     }
     
-    return errorMessages[error] || 'Ha ocurrido un error. Por favor intenta nuevamente.';
+    // Si es un error de duplicate key
+    if (error && error.includes('duplicate')) {
+      return 'Ya existe una cuenta con ese email. Por favor intenta con otro.';
+    }
+    
+    // Seleccionar el mensaje apropiado según el contexto
+    if (isLogin) {
+      return loginMessages[error] || commonMessages[error] || 'Ha ocurrido un error. Por favor intenta nuevamente.';
+    } else {
+      return registerMessages[error] || commonMessages[error] || 'Ha ocurrido un error al crear la cuenta. Por favor intenta nuevamente.';
+    }
   }
 
   return (
@@ -143,8 +176,8 @@ export default function LoginPage() {
           boxShadow: '0 4px 20px rgba(42,0,102,0.08)',
           border: '1px solid rgba(240,241,250,0.6)'
         }}>
-          <h3 style={{fontSize: '18px', marginBottom: '24px', color: 'var(--deep)'}}>
-            {mode === 'login' ? t('loginTitle') : 'Crear Cuenta'}
+          <h3 style={{fontSize: '18px', marginBottom: '24px', color: 'var(--deep)', textAlign: 'center'}}>
+            {mode === 'login' ? t('loginTitle') : 'Crea una cuenta para tu empresa'}
           </h3>
 
           {/* Tenant Name (solo en registro) */}
@@ -213,7 +246,40 @@ export default function LoginPage() {
             </div>
           )}
 
-          {/* Role (solo en registro) */}
+          {/* Usuario Field (solo en login) */}
+          {mode === 'login' && (
+            <div style={{marginBottom: '16px'}}>
+              <label style={{
+                display: 'block',
+                fontSize: '12px',
+                fontWeight: '600',
+                color: 'var(--text)',
+                marginBottom: '6px',
+                textTransform: 'uppercase',
+                letterSpacing: '0.5px'
+              }}>
+                Usuario
+              </label>
+              <input 
+                type="text"
+                value={username} 
+                onChange={e=>setUsername(e.target.value)}
+                placeholder="usuario"
+                required
+                style={{
+                  width: '100%',
+                  padding: '10px 12px',
+                  borderRadius: '8px',
+                  border: '1px solid var(--border)',
+                  fontSize: '14px',
+                  transition: 'all 160ms ease',
+                  fontFamily: 'inherit'
+                }}
+              />
+            </div>
+          )}
+
+          {/* Email Field (solo en registro) */}
           {mode === 'register' && (
             <div style={{marginBottom: '16px'}}>
               <label style={{
@@ -225,11 +291,13 @@ export default function LoginPage() {
                 textTransform: 'uppercase',
                 letterSpacing: '0.5px'
               }}>
-                Rol
+                Email
               </label>
-              <select 
-                value={role} 
-                onChange={e=>setRole(e.target.value)}
+              <input 
+                type="email"
+                value={email} 
+                onChange={e=>setEmail(e.target.value)}
+                placeholder="admin@empresa.com"
                 required
                 style={{
                   width: '100%',
@@ -238,47 +306,11 @@ export default function LoginPage() {
                   border: '1px solid var(--border)',
                   fontSize: '14px',
                   transition: 'all 160ms ease',
-                  fontFamily: 'inherit',
-                  backgroundColor: 'white',
-                  cursor: 'pointer'
+                  fontFamily: 'inherit'
                 }}
-              >
-                <option value="admin">Administrador</option>
-                <option value="agent">Agente</option>
-              </select>
+              />
             </div>
           )}
-
-          {/* Email Field */}
-          <div style={{marginBottom: '16px'}}>
-            <label style={{
-              display: 'block',
-              fontSize: '12px',
-              fontWeight: '600',
-              color: 'var(--text)',
-              marginBottom: '6px',
-              textTransform: 'uppercase',
-              letterSpacing: '0.5px'
-            }}>
-              {t('email')}
-            </label>
-            <input 
-              type="email"
-              value={email} 
-              onChange={e=>setEmail(e.target.value)}
-              placeholder="admin@example.com"
-              required
-              style={{
-                width: '100%',
-                padding: '10px 12px',
-                borderRadius: '8px',
-                border: '1px solid var(--border)',
-                fontSize: '14px',
-                transition: 'all 160ms ease',
-                fontFamily: 'inherit'
-              }}
-            />
-          </div>
 
           {/* Password Field */}
           <div style={{marginBottom: '24px'}}>
@@ -360,7 +392,7 @@ export default function LoginPage() {
                   onClick={() => {
                     setMode('register');
                     setErr('');
-                    setEmail('');
+                    setUsername('');
                     setPassword('');
                   }}
                   style={{
@@ -372,7 +404,7 @@ export default function LoginPage() {
                     textDecoration: 'underline'
                   }}
                 >
-                  Crear una
+                  crea una para tu empresa
                 </button>
               </>
             ) : (
@@ -383,7 +415,7 @@ export default function LoginPage() {
                   onClick={() => {
                     setMode('login');
                     setErr('');
-                    setEmail('admin@example.com');
+                    setUsername('admin');
                     setPassword('secret');
                   }}
                   style={{
