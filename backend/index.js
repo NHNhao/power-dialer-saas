@@ -7,12 +7,69 @@ const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const twilio = require("twilio");
+const multer = require("multer");
+const csv = require("csv-parser");
+const XLSX = require("xlsx");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 // Twilio manda webhooks como application/x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
+
+// Configurar multer para subida de archivos
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = 'uploads/';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Generar nombre único con timestamp
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+// Filtro para aceptar solo archivos CSV y Excel
+const fileFilter = (req, file, cb) => {
+  const allowedMimes = [
+    'text/csv',
+    'application/csv',
+    'text/x-csv',
+    'application/x-csv',
+    'text/comma-separated-values',
+    'text/x-comma-separated-values',
+    'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ];
+  
+  const allowedExtensions = ['.csv', '.xls', '.xlsx'];
+  const ext = path.extname(file.originalname).toLowerCase();
+  
+  if (allowedMimes.includes(file.mimetype) || allowedExtensions.includes(ext)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Solo se permiten archivos CSV (.csv) y Excel (.xls, .xlsx)'), false);
+  }
+};
+
+const upload = multer({ 
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // límite de 10MB
+  }
+});
+
+// Crear carpeta uploads si no existe
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -400,10 +457,25 @@ app.get("/campaigns", requireAuth, async (req, res) => {
   const tenantId = req.user.tenant_id;
   try {
     const r = await pool.query(
-      `SELECT id, name, status, created_at
-       FROM public.campaigns
-       WHERE tenant_id=$1
-       ORDER BY created_at DESC
+      `SELECT 
+         c.id, 
+         c.name, 
+         c.description,
+         c.status, 
+         c.created_at,
+         COUNT(DISTINCT dq.id) FILTER (WHERE dq.state IN ('queued', 'in_progress')) as pending,
+         COUNT(DISTINCT dq.id) FILTER (WHERE dq.state = 'done') as contacted,
+         COUNT(DISTINCT dq.id) as total_leads,
+         CASE 
+           WHEN COUNT(DISTINCT dq.id) FILTER (WHERE dq.state = 'done') > 0 
+           THEN ROUND(100.0 * COUNT(DISTINCT dq.id) FILTER (WHERE dq.outcome = 'success') / COUNT(DISTINCT dq.id) FILTER (WHERE dq.state = 'done'), 0) || '%'
+           ELSE '0%'
+         END as success_rate
+       FROM public.campaigns c
+       LEFT JOIN public.dialer_queue dq ON dq.campaign_id = c.id
+       WHERE c.tenant_id=$1
+       GROUP BY c.id
+       ORDER BY c.created_at DESC
        LIMIT 50`,
       [tenantId]
     );
@@ -413,9 +485,205 @@ app.get("/campaigns", requireAuth, async (req, res) => {
   }
 });
 
+// Update campaign
+app.put("/campaigns/:id", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { id } = req.params;
+  const { 
+    name, 
+    description, 
+    status, 
+    start_date, 
+    end_date, 
+    call_hours_start, 
+    call_hours_end, 
+    max_attempts, 
+    retry_delay_minutes, 
+    dialing_ratio, 
+    script 
+  } = req.body || {};
+
+  try {
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramCount++}`);
+      values.push(name);
+    }
+    if (description !== undefined) {
+      updates.push(`description = $${paramCount++}`);
+      values.push(description);
+    }
+    if (status !== undefined) {
+      updates.push(`status = $${paramCount++}`);
+      values.push(status);
+    }
+    if (start_date !== undefined) {
+      updates.push(`start_date = $${paramCount++}`);
+      values.push(start_date || null);
+    }
+    if (end_date !== undefined) {
+      updates.push(`end_date = $${paramCount++}`);
+      values.push(end_date || null);
+    }
+    if (call_hours_start !== undefined) {
+      updates.push(`call_hours_start = $${paramCount++}`);
+      values.push(call_hours_start);
+    }
+    if (call_hours_end !== undefined) {
+      updates.push(`call_hours_end = $${paramCount++}`);
+      values.push(call_hours_end);
+    }
+    if (max_attempts !== undefined) {
+      updates.push(`max_attempts = $${paramCount++}`);
+      values.push(max_attempts);
+    }
+    if (retry_delay_minutes !== undefined) {
+      updates.push(`retry_delay_minutes = $${paramCount++}`);
+      values.push(retry_delay_minutes);
+    }
+    if (dialing_ratio !== undefined) {
+      updates.push(`dialing_ratio = $${paramCount++}`);
+      values.push(dialing_ratio);
+    }
+    if (script !== undefined) {
+      updates.push(`script = $${paramCount++}`);
+      values.push(script);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ ok: false, error: 'no_fields_to_update' });
+    }
+
+    updates.push(`updated_at = now()`);
+    values.push(id, tenantId);
+
+    const query = `
+      UPDATE public.campaigns 
+      SET ${updates.join(', ')} 
+      WHERE id = $${paramCount++} AND tenant_id = $${paramCount++}
+      RETURNING *
+    `;
+
+    const result = await pool.query(query, values);
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'campaign_not_found' });
+    }
+
+    return res.json({ ok: true, campaign: result.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Delete campaign
+app.delete("/campaigns/:id", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { id } = req.params;
+  
+  try {
+    // Delete campaign and related queue entries (cascade should handle this)
+    const result = await pool.query(
+      `DELETE FROM public.campaigns WHERE id=$1 AND tenant_id=$2 RETURNING id`,
+      [id, tenantId]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'campaign_not_found' });
+    }
+    
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ---------------------
 // Leads (MVP)
 // ---------------------
+// Delete lead
+app.delete("/leads/:id", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { id } = req.params;
+  
+  try {
+    const result = await pool.query(
+      `DELETE FROM public.leads WHERE id=$1 AND tenant_id=$2 RETURNING id`,
+      [id, tenantId]
+    );
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'lead_not_found' });
+    }
+    
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Get all leads
+app.get("/leads", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { status, campaign_id, limit = 100, offset = 0 } = req.query;
+
+  try {
+    let query = `
+      SELECT l.id, l.full_name, l.phone_e164, l.email, l.status, l.source, l.created_at, l.updated_at,
+             COUNT(DISTINCT dq.id) as campaign_count,
+             MAX(cl.started_at) as last_call_at
+      FROM public.leads l
+      LEFT JOIN public.dialer_queue dq ON dq.lead_id = l.id
+      LEFT JOIN public.call_log cl ON cl.lead_id = l.id
+      WHERE l.tenant_id = $1
+    `;
+    
+    const params = [tenantId];
+    let paramIndex = 2;
+
+    if (status) {
+      query += ` AND l.status = $${paramIndex}`;
+      params.push(status);
+      paramIndex++;
+    }
+
+    if (campaign_id) {
+      query += ` AND EXISTS (SELECT 1 FROM public.dialer_queue WHERE lead_id = l.id AND campaign_id = $${paramIndex})`;
+      params.push(campaign_id);
+      paramIndex++;
+    }
+
+    query += ` GROUP BY l.id ORDER BY l.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const result = await pool.query(query, params);
+
+    // Get total count
+    let countQuery = `SELECT COUNT(*) as total FROM public.leads WHERE tenant_id = $1`;
+    const countParams = [tenantId];
+    
+    if (status) {
+      countQuery += ` AND status = $2`;
+      countParams.push(status);
+    }
+
+    const countResult = await pool.query(countQuery, countParams);
+
+    return res.json({ 
+      ok: true, 
+      leads: result.rows,
+      total: parseInt(countResult.rows[0].total),
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.post("/leads", requireAuth, async (req, res) => {
   const tenantId = req.user.tenant_id;
   const { full_name, phone_e164, email, source, meta } = req.body || {};
@@ -440,6 +708,149 @@ app.post("/leads", requireAuth, async (req, res) => {
     return res.json({ ok: true, lead: r.rows[0] });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Upload leads from CSV/XLSX
+app.post("/leads/upload", requireAuth, upload.single('file'), async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { campaign_id } = req.body;
+  
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: "no_file_uploaded" });
+  }
+  
+  if (!campaign_id) {
+    return res.status(400).json({ ok: false, error: "missing_campaign_id" });
+  }
+
+  const filePath = req.file.path;
+  const fileExt = path.extname(req.file.originalname).toLowerCase();
+  const leads = [];
+  let imported = 0;
+  let errors = 0;
+
+  try {
+    // Procesar según el tipo de archivo
+    if (fileExt === '.csv') {
+      // Leer y procesar el archivo CSV
+      await new Promise((resolve, reject) => {
+        fs.createReadStream(filePath)
+          .pipe(csv())
+          .on('data', (row) => {
+            // Esperamos columnas: nombre, telefono_celular (o phone, name, etc.)
+            const name = row.nombre || row.name || row.full_name || '';
+            const phone = row.telefono_celular || row.phone || row.telefono || row.phone_number || '';
+            const email = row.email || row.correo || '';
+            
+            if (phone && phone.trim()) {
+              leads.push({ name: name.trim(), phone: phone.trim(), email: email.trim() });
+            }
+          })
+          .on('end', resolve)
+          .on('error', reject);
+      });
+    } else if (fileExt === '.xlsx' || fileExt === '.xls') {
+      // Leer y procesar archivos Excel
+      const workbook = XLSX.readFile(filePath);
+      const sheetName = workbook.SheetNames[0]; // Primera hoja
+      const worksheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(worksheet);
+      
+      for (const row of rows) {
+        const name = row.nombre || row.name || row.full_name || row.Nombre || row.Name || '';
+        const phone = row.telefono_celular || row.phone || row.telefono || row.phone_number || 
+                     row.Telefono || row.Phone || row['Teléfono'] || '';
+        const email = row.email || row.correo || row.Email || row.Correo || '';
+        
+        if (phone && String(phone).trim()) {
+          leads.push({ 
+            name: String(name).trim(), 
+            phone: String(phone).trim(), 
+            email: String(email).trim() 
+          });
+        }
+      }
+    } else {
+      throw new Error('Formato de archivo no soportado. Use CSV o Excel (.xlsx, .xls)');
+    }
+
+    if (leads.length === 0) {
+      // Eliminar archivo temporal
+      fs.unlinkSync(filePath);
+      return res.status(400).json({ 
+        ok: false, 
+        error: "no_valid_leads", 
+        message: "No se encontraron contactos válidos en el archivo. Asegúrate de que tenga columnas 'nombre' y 'telefono_celular' (o 'name' y 'phone')" 
+      });
+    }
+
+    // Insertar leads en la base de datos
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      for (const lead of leads) {
+        try {
+          // Asegurar formato E.164 para el teléfono
+          let phoneE164 = lead.phone;
+          if (!phoneE164.startsWith('+')) {
+            phoneE164 = '+' + phoneE164.replace(/\D/g, '');
+          }
+
+          // Insertar lead
+          const leadResult = await client.query(
+            `INSERT INTO public.leads (tenant_id, full_name, phone_e164, email, status, source)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_id, phone_e164) DO UPDATE 
+             SET full_name = EXCLUDED.full_name, email = EXCLUDED.email, updated_at = now()
+             RETURNING id`,
+            [tenantId, lead.name, phoneE164, lead.email, 'new', fileExt === '.csv' ? 'csv_upload' : 'excel_upload']
+          );
+
+          const leadId = leadResult.rows[0].id;
+
+          // Agregar a la cola de la campaña
+          await client.query(
+            `INSERT INTO public.dialer_queue (tenant_id, campaign_id, lead_id, state, position)
+             VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(position), 0) + 1 FROM public.dialer_queue WHERE campaign_id = $2))
+             ON CONFLICT (campaign_id, lead_id) DO NOTHING`,
+            [tenantId, campaign_id, leadId, 'queued']
+          );
+
+          imported++;
+        } catch (err) {
+          console.error('Error importing lead:', lead, err.message);
+          errors++;
+        }
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    // Eliminar archivo temporal
+    fs.unlinkSync(filePath);
+
+    return res.json({
+      ok: true,
+      imported,
+      errors,
+      total: leads.length,
+      message: `${imported} contactos importados exitosamente${errors > 0 ? `, ${errors} errores` : ''}`
+    });
+
+  } catch (error) {
+    console.error('Error uploading leads:', error);
+    // Limpiar archivo temporal en caso de error
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return res.status(500).json({ ok: false, error: "upload_failed", details: error.message });
   }
 });
 
@@ -525,7 +936,7 @@ app.post("/dialer/next", requireAuth, async (req, res) => {
 
     await client.query(
       `UPDATE public.dialer_queue
-       SET state='in_progress', updated_at=now(), attempts = attempts + 1
+       SET state='in_progress', updated_at=now()
        WHERE id=$1`,
       [row.queue_id]
     );
@@ -578,7 +989,7 @@ app.post("/dialer/next_and_call", requireAuth, async (req, res) => {
 
     await db.query(
       `UPDATE public.dialer_queue
-       SET state='in_progress', updated_at=now(), attempts = attempts + 1
+       SET state='in_progress', updated_at=now()
        WHERE id=$1`,
       [row.queue_id]
     );
@@ -648,20 +1059,32 @@ async function startTwilioCall({ tenantId, queueId, toNumber }) {
 }
 
 /**
- * TwiML (Power dialer básico)
+ * TwiML (Power dialer con cola de espera)
  */
 app.get("/twilio/voice/twiml", async (req, res) => {
   try {
     res.type("text/xml");
+    const queueId = req.query.queue_id;
     const to = req.query.To || req.query.to || null;
 
-    if (to) {
+    // Si es una llamada directa (no del dialer)
+    if (to && !queueId) {
       return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial>${to}</Dial>
 </Response>`);
     }
 
+    // Modo power dialer con cola: cuando el cliente contesta, va a la cola de espera
+    if (queueId) {
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-ES" voice="Polly.Lupe">Hola, gracias por contestar. Un asesor te atenderá en un momento.</Say>
+  <Enqueue waitUrl="/twilio/voice/wait-music">${queueId}</Enqueue>
+</Response>`);
+    }
+
+    // Fallback
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="es-ES">Hola, te habla un asesor. Un momento por favor.</Say>
@@ -674,6 +1097,18 @@ app.get("/twilio/voice/twiml", async (req, res) => {
     return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>`);
   }
+});
+
+/**
+ * TwiML - Música de espera para la cola
+ */
+app.get("/twilio/voice/wait-music", async (req, res) => {
+  res.type("text/xml");
+  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-ES" voice="Polly.Lupe">Por favor espera, un asesor te atenderá pronto.</Say>
+  <Play loop="10">https://demo.twilio.com/docs/classic.mp3</Play>
+</Response>`);
 });
 
 /**
@@ -697,7 +1132,7 @@ app.post("/twilio/voice/status", async (req, res) => {
        SET call_sid = COALESCE(call_sid, $2),
            updated_at = now(),
            started_at = COALESCE(started_at, CASE WHEN $3 IN ('answered','in-progress') THEN now() ELSE NULL END),
-           ended_at = CASE WHEN $3 IN ('completed','busy','failed','no-answer','canceled') THEN now() ELSE ended_at END,
+           completed_at = CASE WHEN $3 IN ('completed','busy','failed','no-answer','canceled') THEN now() ELSE completed_at END,
            outcome = COALESCE($4, outcome),
            state = CASE WHEN $3 IN ('completed','busy','failed','no-answer','canceled') THEN 'done' ELSE state END
        WHERE id=$1`,
@@ -709,6 +1144,153 @@ app.post("/twilio/voice/status", async (req, res) => {
     // Twilio necesita 200 sí o sí
     return res.status(200).json({ ok: false });
   }
+});
+
+/**
+ * POST /dialer/reset-test-mode
+ * Resetea todos los contactos de una campaña a 'queued' para pruebas
+ */
+app.post("/dialer/reset-test-mode", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { campaign_id } = req.body || {};
+  
+  if (!campaign_id) {
+    return res.status(400).json({ ok: false, error: "missing_campaign_id" });
+  }
+  
+  try {
+    const result = await pool.query(
+      `UPDATE public.dialer_queue
+       SET state = 'queued', 
+           call_sid = NULL,
+           started_at = NULL,
+           completed_at = NULL,
+           outcome = NULL,
+           updated_at = now()
+       WHERE tenant_id = $1 
+         AND campaign_id = $2 
+         AND state = 'in_progress'
+       RETURNING id`,
+      [tenantId, campaign_id]
+    );
+    
+    return res.json({ 
+      ok: true, 
+      reset_count: result.rowCount 
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * GET /dialer/queue-status/:queue_name
+ * Obtiene el estado de la cola de Twilio (cuántas personas esperando)
+ */
+app.get("/dialer/queue-status/:queue_name", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { queue_name } = req.params;
+  
+  try {
+    const { client } = await getTwilioClientForTenant(tenantId);
+    
+    // Buscar la cola por nombre
+    const queues = await client.queues.list({ limit: 100 });
+    const queue = queues.find(q => q.friendlyName === queue_name);
+    
+    if (!queue) {
+      return res.json({ 
+        ok: true, 
+        waiting: 0, 
+        queue_exists: false 
+      });
+    }
+    
+    // Obtener miembros en espera
+    const members = await client.queues(queue.sid).members.list();
+    
+    return res.json({ 
+      ok: true, 
+      queue_exists: true,
+      queue_sid: queue.sid,
+      waiting: members.length,
+      members: members.map(m => ({
+        call_sid: m.callSid,
+        wait_time: m.waitTime,
+        position: m.position
+      }))
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * POST /dialer/dequeue
+ * El agente toma la siguiente llamada de la cola
+ */
+app.post("/dialer/dequeue", requireAuth, async (req, res) => {
+  const tenantId = req.user.tenant_id;
+  const { queue_name, agent_phone } = req.body || {};
+  
+  if (!queue_name) {
+    return res.status(400).json({ ok: false, error: "missing_queue_name" });
+  }
+  
+  try {
+    const { client, default_from_number } = await getTwilioClientForTenant(tenantId);
+    const base = process.env.PUBLIC_BASE_URL;
+    
+    // Buscar la cola
+    const queues = await client.queues.list({ limit: 100 });
+    const queue = queues.find(q => q.friendlyName === queue_name);
+    
+    if (!queue) {
+      return res.status(404).json({ ok: false, error: "queue_not_found" });
+    }
+    
+    // Verificar si hay alguien en espera
+    const members = await client.queues(queue.sid).members.list({ limit: 1 });
+    
+    if (members.length === 0) {
+      return res.json({ ok: true, dequeued: false, message: "No hay llamadas en espera" });
+    }
+    
+    // Dequeue: sacar al primero de la cola y conectar con el agente
+    const firstMember = members[0];
+    
+    // Actualizar el member para sacarlo de la cola y conectarlo
+    await client.queues(queue.sid)
+      .members(firstMember.callSid)
+      .update({
+        url: `${base}/twilio/voice/connect-agent`,
+        method: 'POST'
+      });
+    
+    return res.json({ 
+      ok: true, 
+      dequeued: true,
+      call_sid: firstMember.callSid,
+      wait_time: firstMember.waitTime
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/**
+ * TwiML - Conectar cliente con agente
+ */
+app.post("/twilio/voice/connect-agent", async (req, res) => {
+  res.type("text/xml");
+  // Aquí conectamos al cliente que estaba en cola con el agente
+  return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-ES" voice="Polly.Lupe">Te estamos conectando con un asesor.</Say>
+  <Pause length="1"/>
+  <Say language="es-ES" voice="Polly.Lupe">Por favor espera un momento.</Say>
+  <Pause length="60"/>
+</Response>`);
 });
 
 // ======================================================
@@ -1194,6 +1776,36 @@ app.post("/dialer/parallel/start", requireAuth, requireAdmin, async (req, res) =
     launched,
     errors,
   });
+});
+
+// ---------------------
+// Middleware de manejo de errores para multer
+// ---------------------
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'file_too_large', 
+        message: 'El archivo es demasiado grande. El tamaño máximo es 10MB.' 
+      });
+    }
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'upload_error', 
+      message: error.message 
+    });
+  }
+  
+  if (error.message && error.message.includes('Solo se permiten archivos')) {
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'invalid_file_type', 
+      message: error.message 
+    });
+  }
+  
+  next(error);
 });
 
 // ---------------------

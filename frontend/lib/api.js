@@ -67,6 +67,41 @@ export async function dialerNext(token, campaign_id) {
   return r.json();
 }
 
+export async function dialerNextAndCall(token, campaign_id) {
+  if (USE_MOCK) return { ok: true, next: mock.next, call_sid: 'MOCK_SID' };
+  const r = await fetch('http://localhost:3001/dialer/next_and_call', {
+    method: 'POST', headers: { Authorization: 'Bearer '+token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ campaign_id })
+  });
+  return r.json();
+}
+
+export async function resetTestMode(token, campaign_id) {
+  if (USE_MOCK) return { ok: true, reset_count: 0 };
+  const r = await fetch('http://localhost:3001/dialer/reset-test-mode', {
+    method: 'POST', headers: { Authorization: 'Bearer '+token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ campaign_id })
+  });
+  return r.json();
+}
+
+export async function getQueueStatus(token, queue_name) {
+  if (USE_MOCK) return { ok: true, waiting: 2, queue_exists: true };
+  const r = await fetch(`http://localhost:3001/dialer/queue-status/${encodeURIComponent(queue_name)}`, {
+    method: 'GET', headers: { Authorization: 'Bearer '+token }
+  });
+  return r.json();
+}
+
+export async function dequeueCall(token, queue_name) {
+  if (USE_MOCK) return { ok: true, dequeued: true, call_sid: 'MOCK_SID' };
+  const r = await fetch('http://localhost:3001/dialer/dequeue', {
+    method: 'POST', headers: { Authorization: 'Bearer '+token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ queue_name })
+  });
+  return r.json();
+}
+
 export async function saveDisposition(token, queue_id, disposition) {
   if (USE_MOCK) return { ok: true };
   const r = await fetch('http://localhost:3001/dialer/disposition', {
@@ -145,6 +180,33 @@ export async function uploadLeads(token, campaignId, file) {
   return r.json();
 }
 
+export async function getLeads(token, params = {}) {
+  if (USE_MOCK) {
+    const mockLeads = [
+      { id: 'l1', full_name: 'Juan Pérez', phone_e164: '+573001234567', email: 'juan@example.com', status: 'new', campaign_count: 2, last_call_at: null, created_at: new Date().toISOString() },
+      { id: 'l2', full_name: 'María García', phone_e164: '+573007654321', email: 'maria@example.com', status: 'contacted', campaign_count: 1, last_call_at: new Date().toISOString(), created_at: new Date().toISOString() }
+    ];
+    return { ok: true, leads: mockLeads, total: mockLeads.length, limit: 100, offset: 0 };
+  }
+  
+  const queryParams = new URLSearchParams(params);
+  const r = await fetch(`http://localhost:3001/leads?${queryParams}`, {
+    headers: { Authorization: 'Bearer '+token }
+  });
+  return r.json();
+}
+
+export async function deleteLead(token, id) {
+  if (USE_MOCK) {
+    return { ok: true };
+  }
+  const r = await fetch(`http://localhost:3001/leads/${id}`, {
+    method: 'DELETE',
+    headers: { Authorization: 'Bearer '+token }
+  });
+  return r.json();
+}
+
 export default { 
   login, 
   getCampaigns, 
@@ -152,8 +214,14 @@ export default {
   updateCampaign,
   deleteCampaign,
   uploadLeads,
+  getLeads,
+  deleteLead,
   requestTwilioToken, 
-  dialerNext, 
+  dialerNext,
+  dialerNextAndCall,
+  resetTestMode,
+  getQueueStatus,
+  dequeueCall, 
   saveDisposition 
 };
 
