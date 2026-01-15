@@ -239,10 +239,11 @@ app.post("/setup/bootstrap", async (req, res) => {
 
 /**
  * POST /auth/register
- * Crea un nuevo tenant + usuario (admin o agent)
+ * Crea un nuevo tenant + usuario admin
+ * Genera username automáticamente y retorna token
  */
 app.post("/auth/register", async (req, res) => {
-  const { tenant_name, admin_email, admin_name, admin_password, role } = req.body || {};
+  const { tenant_name, admin_email, admin_name, admin_password } = req.body || {};
 
   if (!tenant_name || !admin_email || !admin_name || !admin_password) {
     return res.status(400).json({
@@ -252,8 +253,8 @@ app.post("/auth/register", async (req, res) => {
     });
   }
 
-  // Validar rol
-  const userRole = role && (role === 'admin' || role === 'agent') ? role : 'admin';
+  // Generar username automáticamente: nombre + ".admin"
+  const admin_username = admin_name.toLowerCase().trim().replace(/\s+/g, '.') + '.admin';
 
   const client = await pool.connect();
   try {
@@ -270,51 +271,127 @@ app.post("/auth/register", async (req, res) => {
     const password_hash = await bcrypt.hash(admin_password, rounds);
 
     const userIns = await client.query(
-      `INSERT INTO public.users (tenant_id, email, name, password_hash, role)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, tenant_id, email, name, role, created_at`,
-      [tenant.id, admin_email, admin_name, password_hash, userRole]
+      `INSERT INTO public.users (tenant_id, username, name, email, password_hash, role)
+       VALUES ($1, $2, $3, $4, $5, 'admin')
+       RETURNING id, tenant_id, username, name, email, role, created_at`,
+      [tenant.id, admin_username, admin_name, admin_email, password_hash]
     );
     const user = userIns.rows[0];
+
+    // Crear JWT token
+    const payload = {
+      user_id: user.id,
+      tenant_id: user.tenant_id,
+      role: user.role,
+      username: user.username,
+      name: user.name,
+      email: user.email
+    };
+    
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    });
 
     await client.query(
       `INSERT INTO public.audit_log (tenant_id, user_id, action, meta)
        VALUES ($1, $2, 'user_registered', $3::jsonb)`,
-      [tenant.id, user.id, JSON.stringify({ tenant_name, admin_email, role: userRole })]
+      [tenant.id, user.id, JSON.stringify({ tenant_name, admin_username, admin_email, role: 'admin' })]
     );
 
     await client.query("COMMIT");
-    return res.json({ ok: true, tenant, user });
+    return res.json({ 
+      ok: true, 
+      token, 
+      user: payload,
+      tenant 
+    });
   } catch (e) {
     try {
       await client.query("ROLLBACK");
     } catch {}
-    return res.status(500).json({ ok: false, error: e.message });
+    
+    // Manejar errores específicos
+    if (e.code === '23505') {
+      // Duplicate key
+      return res.status(400).json({ ok: false, error: 'duplicate_key' });
+    }
+    
+    console.error('Error en registro:', e);
+    return res.status(500).json({ ok: false, error: 'register_failed' });
   } finally {
     client.release();
   }
 });
 
 app.post("/auth/login", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return res.status(400).json({ ok: false, error: "missing_email_or_password" });
+  const { username, password } = req.body || {};
+  console.log('Login attempt - username:', username, 'password length:', password?.length);
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: "missing_username_or_password" });
   }
 
   try {
+    // Buscar por email O username (el parámetro se llama username por compatibilidad)
     const r = await pool.query(
-      `SELECT id, tenant_id, email, name, role, password_hash
+      `SELECT id, tenant_id, username, name, email, role, password_hash
        FROM public.users
-       WHERE email = $1
+       WHERE username = $1 OR email = $1
        LIMIT 1`,
-      [email]
+      [username]
     );
 
+    console.log('User found:', r.rowCount > 0 ? r.rows[0].username : 'none');
     if (r.rowCount === 0) return res.status(401).json({ ok: false, error: "invalid_credentials" });
 
     const u = r.rows[0];
     const ok = await bcrypt.compare(password, u.password_hash);
+    console.log('Password match:', ok);
     if (!ok) return res.status(401).json({ ok: false, error: "invalid_credentials" });
+
+    const payload = {
+      user_id: u.id,
+      tenant_id: u.tenant_id,
+      role: u.role,
+      username: u.username,
+      name: u.name,
+      email: u.email,
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+    });
+
+    return res.json({ ok: true, token, user: payload });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /auth/login - Login con username o email
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, error: "missing_username_or_password" });
+    }
+
+    // Buscar usuario por username o email
+    const r = await pool.query(
+      `SELECT id, tenant_id, role, email, name, username, password_hash
+       FROM public.users
+       WHERE username = $1 OR email = $1`,
+      [username]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
+
+    const u = r.rows[0];
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) {
+      return res.status(401).json({ ok: false, error: "invalid_credentials" });
+    }
 
     const payload = {
       user_id: u.id,
@@ -322,6 +399,7 @@ app.post("/auth/login", async (req, res) => {
       role: u.role,
       email: u.email,
       name: u.name,
+      username: u.username,
     };
 
     const token = jwt.sign(payload, process.env.JWT_SECRET, {

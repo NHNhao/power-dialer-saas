@@ -183,6 +183,13 @@ export default function Agent() {
   }
 
   function hangup() {
+    // Desconectar la llamada activa de Twilio
+    if (connRef.current) {
+      console.log('🔴 Colgando llamada activa...');
+      connRef.current.disconnect();
+      connRef.current = null;
+    }
+    
     setAgentState('wrapup');
     setLead(null);
   }

@@ -7,8 +7,8 @@ export function AuthProvider({ children }) {
   const [token, setToken] = useState(typeof window !== 'undefined' ? localStorage.getItem('token') : null)
   const [user, setUser] = useState(null)
 
-  async function login(email, password) {
-    const r = await Api.login(email, password)
+  async function login(username, password) {
+    const r = await Api.login(username, password)
     if (r.ok) {
       setToken(r.token)
       setUser(r.user)
@@ -17,12 +17,18 @@ export function AuthProvider({ children }) {
     return r
   }
 
+  function setTokenAndUser(newToken, newUser) {
+    setToken(newToken)
+    setUser(newUser)
+    localStorage.setItem('token', newToken)
+  }
+
   function logout() {
     setToken(null); setUser(null); localStorage.removeItem('token')
   }
 
   return (
-    <AuthContext.Provider value={{ token, user, login, logout }}>
+    <AuthContext.Provider value={{ token, user, login, logout, setTokenAndUser }}>
       {children}
     </AuthContext.Provider>
   )
